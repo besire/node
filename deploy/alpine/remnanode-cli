@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs dist/cli.js against the running node (dump config, kill sockets).
+set -eu
+
+APP_DIR="${REMNANODE_HOME:-/opt/remnanode}"
+RUN_DIR="${REMNANODE_RUN_DIR:-/run/remnanode}"
+
+if [ -f "$RUN_DIR/internal.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$RUN_DIR/internal.env"
+    set +a
+fi
+
+exec node "$APP_DIR/dist/cli.js" "$@"

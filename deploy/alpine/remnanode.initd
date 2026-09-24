@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh
+
+name="remnanode"
+description="Remnawave Node"
+
+supervisor="supervise-daemon"
+command="/opt/remnanode/deploy/remnanode-start"
+output_log="/var/log/remnanode/node.log"
+error_log="/var/log/remnanode/node.log"
+
+respawn_delay=5
+respawn_max=0
+# Node stops Xray (up to 10s) and removes its nftables table on shutdown.
+retry="SIGTERM/20/SIGKILL/5"
+
+depend() {
+    # Soft dependency: node only listens on NODE_PORT, a failing interface
+    # config (LXC/Incus often configure networking from the host) must not keep it down.
+    use net
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0755 /var/log/remnanode
+    checkpath -d -m 0755 /var/log/xray
+}

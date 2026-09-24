@@ -1,4 +1,4 @@
-.PHONY: bump-patch bump-minor bump-major help tag-release image image-save image-variants
+.PHONY: bump-patch bump-minor bump-major help tag-release image image-save image-variants package-alpine
 
 # Default target
 help:
@@ -11,6 +11,7 @@ help:
 	@echo "  image            - Build the image locally and load it into docker"
 	@echo "  image-save       - Build and pack it into $(OUT_DIR)/*.tar.gz"
 	@echo "  image-variants   - List the variants defined in docker-bake.hcl"
+	@echo "  package-alpine   - Build build/remnanode-alpine-<arch>.tar.gz (no Docker runtime needed)"
 	@echo ""
 	@echo "  Overridable: VARIANT=$(VARIANT) PLATFORM=$(PLATFORM) IMAGE=$(IMAGE) TAG=$(TAG) OUT_DIR=$(OUT_DIR)"
 	@echo "  e.g. make image-save PLATFORM=linux/arm64"
@@ -78,3 +79,6 @@ image-variants:
 
 
 
+
+package-alpine:
+	sh scripts/package-alpine.sh
