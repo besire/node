@@ -1,0 +1,1268 @@
+#!/bin/sh
+# rwnode - Remnawave Node manager for Linux without Docker
+# (Debian, Ubuntu, RHEL family, Alpine; LXC containers or VMs).
+#
+#   wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/besire/node/releases/latest/download/install.sh | sh
+#
+# Without arguments it opens the menu, `rwnode help` lists the commands.
+#
+# shellcheck disable=SC2059 # printf formats only embed the constant C_* color codes
+set -eu
+
+REPO="${REMNANODE_REPO:-besire/node}"
+RELEASE="${REMNANODE_RELEASE:-latest}"
+XRAY_VERSION_DEFAULT="v26.7.28"
+XRAY_REPO="${XRAY_REPO:-XTLS}"
+GEOCHECK_VERSION="0.3.0"
+NODE_VERSION="v24.21.0"
+NODE_MIRROR="${NODE_MIRROR:-https://nodejs.org/dist}"
+ASN_URL="${ASN_URL:-https://github.com/remnawave/asn-index/releases/latest/download/asn-prefixes.lmdb.zst}"
+
+APP_DIR=/opt/remnanode
+RUNTIME_DIR=/usr/local/lib/remnanode
+RUNTIME_NODE=$RUNTIME_DIR/node/bin/node
+CONF_DIR=/etc/remnanode
+CONF_FILE=$CONF_DIR/remnanode.env
+STATE_DIR=/var/lib/remnanode
+LOG_DIR=/var/log/remnanode
+NODE_LOG=$LOG_DIR/node.log
+XRAY_LOG=/var/log/xray/current
+RUN_DIR=/run/remnanode
+BIN_DIR=/usr/local/bin
+SELF=$BIN_DIR/rwnode
+XRAY_ASSETS=/usr/local/share/xray
+ASN_DIR=/usr/local/share/asn
+SYSTEMD_UNIT=/etc/systemd/system/remnanode.service
+OPENRC_INITD=/etc/init.d/remnanode
+
+# ------------------------------------------------------------------ output
+
+if [ -t 1 ]; then
+    C_RESET='\033[0m' C_BOLD='\033[1m' C_DIM='\033[2m'
+    C_RED='\033[31m' C_GREEN='\033[32m' C_YELLOW='\033[33m' C_CYAN='\033[36m'
+else
+    C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+fi
+
+log() { printf "${C_GREEN}==>${C_RESET} %s\n" "$*"; }
+warn() { printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*" >&2; }
+die() {
+    printf "${C_RED}[x]${C_RESET} %s\n" "$*" >&2
+    exit 1
+}
+
+# ------------------------------------------------------------------ input
+
+# Answers come from the terminal even when the script itself arrives on
+# stdin (wget -qO- ... | sh).
+if [ -t 0 ]; then
+    IN=/dev/stdin
+elif (: </dev/tty) 2>/dev/null; then
+    IN=/dev/tty
+else
+    IN=""
+fi
+
+ask() {
+    # ask VAR "prompt" [default]
+    [ -n "$IN" ] || die "需要输入 $2，但当前没有可用的终端，请通过参数传入（rwnode help）"
+    if [ -n "${3:-}" ]; then printf '%s [%s]: ' "$2" "$3"; else printf '%s: ' "$2"; fi
+    IFS= read -r _answer <"$IN" || {
+        _answer=""
+        ASK_EOF=1
+    }
+    [ -n "$_answer" ] || _answer=${3:-}
+    eval "$1=\$_answer"
+}
+
+# The panel's SECRET_KEY is several KB; in canonical mode the terminal line
+# buffer (4095 bytes) would silently truncate a paste.
+ask_long() {
+    [ -n "$IN" ] || die "需要输入 $2，但当前没有可用的终端，请通过参数传入（rwnode help）"
+    printf '%s: ' "$2"
+    _stty=$(stty -g <"$IN" 2>/dev/null || true)
+    [ -z "$_stty" ] || stty -icanon min 1 time 0 <"$IN" 2>/dev/null || true
+    IFS= read -r _answer <"$IN" || _answer=""
+    [ -z "$_stty" ] || stty "$_stty" <"$IN" 2>/dev/null || true
+    eval "$1=\$_answer"
+}
+
+confirm() {
+    # confirm "question" y|n  -> 0 for yes
+    if [ "$2" = y ]; then _hint="Y/n"; else _hint="y/N"; fi
+    ask _yn "$1 ($_hint)" ""
+    case "${_yn:-$2}" in y | Y | yes | YES | 是) return 0 ;; *) return 1 ;; esac
+}
+
+pause() {
+    [ -n "$IN" ] || return 0
+    printf "${C_DIM}按回车返回菜单...${C_RESET}"
+    IFS= read -r _ <"$IN" || true
+}
+
+# ------------------------------------------------------------------ system
+
+detect_system() {
+    [ "$(id -u)" = 0 ] || die "请使用 root 运行"
+    [ "$(uname -s)" = Linux ] || die "只支持 Linux"
+
+    OS_NAME=Linux
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        OS_NAME=$(. /etc/os-release && echo "${PRETTY_NAME:-${NAME:-Linux}}")
+    fi
+
+    case "$(uname -m)" in
+        x86_64 | amd64)
+            ARCH=x64
+            GO_ARCH=amd64
+            XRAY_ZIP=Xray-linux-64.zip
+            ;;
+        aarch64 | arm64)
+            ARCH=arm64
+            GO_ARCH=arm64
+            XRAY_ZIP=Xray-linux-arm64-v8a.zip
+            ;;
+        *) die "不支持的 CPU 架构：$(uname -m)（支持 x86_64、aarch64）" ;;
+    esac
+
+    if [ -f /etc/alpine-release ] || ldd --version 2>&1 | grep -qi musl; then LIBC=musl; else LIBC=glibc; fi
+
+    PKG=none
+    for _p in apk apt-get dnf yum zypper pacman; do
+        if command -v "$_p" >/dev/null 2>&1; then
+            PKG=$_p
+            break
+        fi
+    done
+
+    detect_init
+}
+
+detect_init() {
+    if [ -d /run/systemd/system ]; then
+        INIT=systemd
+    elif command -v openrc-run >/dev/null 2>&1 || [ -f /etc/alpine-release ]; then
+        INIT=openrc
+    else
+        INIT=none
+    fi
+}
+
+glibc_version() {
+    ldd --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+$' || echo 0
+}
+
+version_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, "."); if (x[1] != y[1]) exit !(x[1] > y[1]); exit !(x[2] + 0 >= y[2] + 0) }'
+}
+
+fetch() {
+    # fetch URL DEST
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --connect-timeout 15 -o "$2" "$1" </dev/null
+        return
+    fi
+    command -v wget >/dev/null 2>&1 || return 1
+    for _try in 1 2 3; do
+        if wget -q -T 30 -O "$2" "$1" </dev/null; then return 0; fi
+        sleep 2
+    done
+    return 1
+}
+
+APT_LISTS_EMPTY=""
+
+apt_lists_empty() {
+    for _f in /var/lib/apt/lists/*; do
+        case "${_f##*/}" in lock | partial | '*') ;; *) return 1 ;; esac
+    done
+}
+
+pkg_install() {
+    log "安装系统依赖：$*"
+    case "$PKG" in
+        apk) apk add --no-cache --quiet "$@" </dev/null ;;
+        apt-get)
+            if apt_lists_empty; then APT_LISTS_EMPTY=1; fi
+            DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "$@" </dev/null >/dev/null
+            ;;
+        dnf) dnf install -y -q "$@" </dev/null >/dev/null ;;
+        yum) yum install -y -q "$@" </dev/null >/dev/null ;;
+        zypper) zypper -n -q install "$@" </dev/null >/dev/null ;;
+        pacman) pacman -Sy --noconfirm --needed "$@" </dev/null >/dev/null ;;
+        *) die "缺少 $*，且没有可用的包管理器，请手动安装后重试" ;;
+    esac || die "安装系统依赖失败：$*"
+}
+
+# The package lists are only needed for this install: leave the disk as we found it.
+pkg_cleanup() {
+    if [ "$PKG" = apt-get ] && [ -n "$APT_LISTS_EMPTY" ]; then
+        rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    fi
+}
+
+has_ca_bundle() {
+    for _f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+        [ -s "$_f" ] && return 0
+    done
+    return 1
+}
+
+# busybox wget cannot use an HTTP proxy for https (no CONNECT) and only
+# follows simple redirects: prefer curl there.
+wget_usable() {
+    command -v wget >/dev/null 2>&1 && ! wget --help 2>&1 | head -n 1 | grep -qi busybox
+}
+
+ensure_tools() {
+    _need=""
+    if ! command -v curl >/dev/null 2>&1 && ! wget_usable; then
+        if [ "$PKG" != none ] || ! command -v wget >/dev/null 2>&1; then _need="$_need curl"; fi
+    fi
+    command -v tar >/dev/null 2>&1 || _need="$_need tar"
+    command -v gzip >/dev/null 2>&1 || _need="$_need gzip"
+    has_ca_bundle || _need="$_need ca-certificates"
+    command -v logrotate >/dev/null 2>&1 || _need="$_need logrotate"
+    if [ "$PKG" = apk ] && ! command -v openrc-run >/dev/null 2>&1; then _need="$_need openrc"; fi
+    if [ -n "$_need" ]; then
+        # shellcheck disable=SC2086
+        pkg_install $_need
+        detect_init
+    fi
+}
+
+release_url() {
+    if [ -n "${REMNANODE_DOWNLOAD_URL:-}" ]; then
+        echo "${REMNANODE_DOWNLOAD_URL%/}"
+    elif [ "$RELEASE" = latest ]; then
+        echo "https://github.com/$REPO/releases/latest/download"
+    else
+        echo "https://github.com/$REPO/releases/download/$RELEASE"
+    fi
+}
+
+verify_sha256() {
+    # verify_sha256 FILE SUMFILE  (SUMFILE: "<hash>  <any name>")
+    (cd "$(dirname "$1")" && awk -v f="$(basename "$1")" 'NR == 1 { print $1 "  " f }' "$2" | sha256sum -c - >/dev/null 2>&1)
+}
+
+xz_decompress() {
+    if command -v xz >/dev/null 2>&1; then xz -dc "$1"; else unxz -c "$1"; fi
+}
+
+has_xz() {
+    command -v xz >/dev/null 2>&1 || command -v unxz >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ node.js
+
+node_major() {
+    "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null </dev/null || echo 0
+}
+
+resolve_node() {
+    if [ -x "$RUNTIME_NODE" ]; then
+        NODE=$RUNTIME_NODE
+    elif command -v node >/dev/null 2>&1 && [ "$(node_major node)" -ge 24 ]; then
+        NODE=node
+    else
+        NODE=""
+    fi
+}
+
+install_runtime() {
+    if [ "$PKG" = apk ] && [ "$LIBC" = musl ]; then
+        _had_node=""
+        if apk info -e nodejs >/dev/null 2>&1; then _had_node=1; fi
+        if apk add --no-cache --quiet nodejs </dev/null >/dev/null 2>&1 && [ "$(node_major node)" -ge 24 ]; then
+            rm -rf "$RUNTIME_DIR/node"
+            NODE=node
+            log "使用系统 Node.js $(node -v)"
+            return 0
+        fi
+        # Alpine < 3.23 ships Node.js 22: drop it again, use the standalone runtime.
+        if [ -z "$_had_node" ]; then apk del --quiet nodejs </dev/null >/dev/null 2>&1 || true; fi
+        [ "$ARCH" = x64 ] || die "Alpine $(cat /etc/alpine-release) 自带的 Node.js 低于 24，arm64 请使用 Alpine 3.23 或更新版本"
+        apk add --no-cache --quiet libstdc++ libgcc </dev/null >/dev/null 2>&1 || die "安装 libstdc++ 失败"
+    fi
+
+    if [ "$LIBC" = glibc ]; then
+        _glibc=$(glibc_version)
+        version_ge "$_glibc" 2.28 || die "glibc $_glibc 太旧，Node.js 24 需要 2.28+（Debian 10、Ubuntu 20.04、RHEL 8 及更新版本）"
+    fi
+
+    if [ -x "$RUNTIME_NODE" ] && [ "$("$RUNTIME_NODE" -v 2>/dev/null </dev/null)" = "$NODE_VERSION" ]; then
+        NODE=$RUNTIME_NODE
+        log "Node.js $NODE_VERSION 已安装"
+        return 0
+    fi
+
+    log "安装 Node.js $NODE_VERSION 运行时"
+    mkdir -p "$TMP/rt"
+    if ! fetch_rwnode_runtime && ! fetch_official_runtime; then
+        die "下载 Node.js $NODE_VERSION 失败"
+    fi
+    [ -x "$TMP/rt/node/bin/node" ] || die "Node.js 运行时包不完整"
+    chown -R 0:0 "$TMP/rt/node"
+    chmod -R go-w "$TMP/rt/node"
+
+    mkdir -p "$RUNTIME_DIR"
+    rm -rf "$RUNTIME_DIR/node.new" "$RUNTIME_DIR/node.old"
+    mv "$TMP/rt/node" "$RUNTIME_DIR/node.new"
+    if [ -d "$RUNTIME_DIR/node" ]; then mv "$RUNTIME_DIR/node" "$RUNTIME_DIR/node.old"; fi
+    mv "$RUNTIME_DIR/node.new" "$RUNTIME_DIR/node"
+    rm -rf "$RUNTIME_DIR/node.old"
+
+    [ "$(node_major "$RUNTIME_NODE")" -ge 24 ] || die "Node.js 运行时无法启动"
+    NODE=$RUNTIME_NODE
+}
+
+# Stripped build published with each release (about 17 MB smaller than upstream).
+fetch_rwnode_runtime() {
+    _name="node-runtime-$NODE_VERSION-$LIBC-$ARCH"
+    if has_xz; then _ext=tar.xz; else _ext=tar.gz; fi
+    _file="$TMP/$_name.$_ext"
+    fetch "$(release_url)/$_name.$_ext" "$_file" 2>/dev/null || return 1
+    fetch "$(release_url)/$_name.$_ext.sha256" "$_file.sha256" 2>/dev/null || return 1
+    verify_sha256 "$_file" "$_file.sha256" || die "Node.js 运行时校验失败：$_name.$_ext"
+    if [ "$_ext" = tar.xz ]; then xz_decompress "$_file" | tar -xf - -C "$TMP/rt"; else tar -xzf "$_file" -C "$TMP/rt"; fi
+}
+
+fetch_official_runtime() {
+    _variant="linux-$ARCH"
+    if [ "$LIBC" = musl ]; then _variant="linux-$ARCH-musl"; fi
+    if has_xz; then _ext=tar.xz; else _ext=tar.gz; fi
+    _name="node-$NODE_VERSION-$_variant"
+    _file="$TMP/$_name.$_ext"
+    warn "改用 nodejs.org 的官方构建"
+    rm -rf "$TMP/rt/node"
+    fetch "$NODE_MIRROR/$NODE_VERSION/$_name.$_ext" "$_file" || return 1
+    fetch "$NODE_MIRROR/$NODE_VERSION/SHASUMS256.txt" "$TMP/SHASUMS256.txt" || return 1
+    grep " $_name.$_ext\$" "$TMP/SHASUMS256.txt" > "$_file.sha256" || return 1
+    verify_sha256 "$_file" "$_file.sha256" || die "Node.js 官方构建校验失败：$_name.$_ext"
+    if [ "$_ext" = tar.xz ]; then
+        xz_decompress "$_file" | tar -xf - -C "$TMP" "$_name/bin/node" "$_name/LICENSE"
+    else
+        tar -xzf "$_file" -C "$TMP" "$_name/bin/node" "$_name/LICENSE"
+    fi
+    mkdir -p "$TMP/rt/node"
+    mv "$TMP/$_name/bin" "$TMP/$_name/LICENSE" "$TMP/rt/node/"
+}
+
+# ------------------------------------------------------------------ helpers run by node
+
+# Xray ships as .zip; unzip is missing on stock Debian/Ubuntu images.
+node_unzip() {
+    # node_unzip ZIP DESTDIR ENTRY...
+    "$NODE" -e '
+        const fs = require("fs"), zlib = require("zlib"), path = require("path");
+        const [zip, dest, ...entries] = process.argv.slice(1);
+        const b = fs.readFileSync(zip);
+        let e = b.length - 22;
+        while (e >= 0 && b.readUInt32LE(e) !== 0x06054b50) e--;
+        if (e < 0) throw new Error("not a zip file");
+        let p = b.readUInt32LE(e + 16);
+        const found = new Set();
+        for (let i = b.readUInt16LE(e + 10); i > 0; i--) {
+            if (b.readUInt32LE(p) !== 0x02014b50) throw new Error("corrupt zip directory");
+            const method = b.readUInt16LE(p + 10), crc = b.readUInt32LE(p + 16), size = b.readUInt32LE(p + 20);
+            const nameLen = b.readUInt16LE(p + 28), extra = b.readUInt16LE(p + 30), comment = b.readUInt16LE(p + 32);
+            const offset = b.readUInt32LE(p + 42), name = b.toString("utf8", p + 46, p + 46 + nameLen);
+            p += 46 + nameLen + extra + comment;
+            if (!entries.includes(name)) continue;
+            const start = offset + 30 + b.readUInt16LE(offset + 26) + b.readUInt16LE(offset + 28);
+            const raw = b.subarray(start, start + size);
+            const data = method === 0 ? raw : method === 8 ? zlib.inflateRawSync(raw) : null;
+            if (!data) throw new Error("unsupported compression in " + name);
+            if (zlib.crc32(data) !== crc) throw new Error("crc mismatch in " + name);
+            fs.writeFileSync(path.join(dest, path.basename(name)), data);
+            found.add(name);
+        }
+        const missing = entries.filter((n) => !found.has(n));
+        if (missing.length) throw new Error("missing in zip: " + missing.join(", "));
+    ' "$@" </dev/null
+}
+
+node_unzstd() {
+    "$NODE" -e '
+        const fs = require("fs"), zlib = require("zlib"), { pipeline } = require("stream");
+        pipeline(fs.createReadStream(process.argv[1]), zlib.createZstdDecompress(), fs.createWriteStream(process.argv[2]),
+            (err) => { if (err) { console.error(err.message); process.exit(1); } });
+    ' "$1" "$2" </dev/null
+}
+
+# ------------------------------------------------------------------ config
+
+conf_get() {
+    sed -n "s/^$1=//p" "$CONF_FILE" 2>/dev/null | tail -n 1 | tr -d "\"'"
+}
+
+# Accepts the key as the panel shows it, e.g. SECRET_KEY="eyJ..." or - SECRET_KEY=eyJ...
+normalize_key() {
+    printf '%s' "$1" | tr -d ' \t\r\n' |
+        sed -e 's/^-*//' -e 's/^SECRET_KEY=//' -e "s/^[\"']//" -e "s/[\"']\$//"
+}
+
+# sh has no local variables: helpers use names that no caller uses (_vk_*).
+valid_key() {
+    _vk_json=$(printf '%s' "$1" | base64 -d 2>/dev/null) || return 1
+    for _vk_field in caCertPem jwtPublicKey nodeCertPem nodeKeyPem; do
+        case "$_vk_json" in *"\"$_vk_field\""*) ;; *) return 1 ;; esac
+    done
+}
+
+valid_port() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# conf_set KEY VALUE: replace or append one setting, keep everything else.
+conf_set() {
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    (
+        umask 077
+        if [ -f "$CONF_FILE" ]; then
+            grep -v "^$1=" "$CONF_FILE" > "$CONF_FILE.new" || true
+        else
+            cat > "$CONF_FILE.new" <<'EOF'
+# Remnawave Node configuration, applied on restart (rwnode restart).
+#
+# Optional settings (defaults shown):
+# SNI_VERIFICATION=false
+# DISABLE_HASHED_SET_CHECK=false
+# NFTABLES_LOGGING=true
+# NFTABLES_ACCEPT_REPLY_TRAFFIC=false
+#
+# Memory (defaults are already tuned, see deploy/linux/README.md):
+# NODE_MAX_HEAP_MB=             cap the node's JS heap in MB, e.g. 256 on very small VPS
+# NODE_SEMI_SPACE_MB=2          V8 young generation size in MB, empty = V8 default
+# NODE_V8_FLAGS=--optimize-for-size   empty = V8 default
+EOF
+        fi
+        if [ "$1" = SECRET_KEY ]; then
+            printf "%s='%s'\n" "$1" "$2" >> "$CONF_FILE.new"
+        else
+            printf '%s=%s\n' "$1" "$2" >> "$CONF_FILE.new"
+        fi
+        mv -f "$CONF_FILE.new" "$CONF_FILE"
+    )
+}
+
+configure() {
+    _key=$(normalize_key "$SECRET_KEY_ARG")
+    _port=$NODE_PORT_ARG
+
+    [ -n "$_port" ] || _port=$(conf_get NODE_PORT)
+    if [ -z "$_port" ] && [ -n "$IN" ]; then ask _port "节点端口（面板连接节点用）" 2222; fi
+    [ -n "$_port" ] || _port=2222
+    valid_port "$_port" || die "端口无效：$_port"
+
+    [ -n "$_key" ] || _key=$(conf_get SECRET_KEY)
+    if [ -z "$_key" ]; then
+        [ -n "$IN" ] || die "缺少 SECRET_KEY：请用 --secret-key '<面板中的 SECRET_KEY>' 传入"
+        ask_long _key "粘贴面板中的 SECRET_KEY（可直接粘贴 SECRET_KEY=\"...\" 整行）"
+        _key=$(normalize_key "$_key")
+    fi
+    valid_key "$_key" || die "SECRET_KEY 无效，请从面板重新复制（节点 -> 复制 SECRET_KEY）"
+
+    conf_set NODE_PORT "$_port"
+    conf_set SECRET_KEY "$_key"
+    NODE_PORT=$_port
+    log "配置已保存到 $CONF_FILE（端口 $_port）"
+}
+
+# ------------------------------------------------------------------ components
+
+install_app() {
+    _name="remnanode-$LIBC-$ARCH.tar.gz"
+    _pkg="$TMP/$_name"
+
+    case "$TARBALL" in
+        "")
+            log "下载节点程序 $_name（$REPO $RELEASE）"
+            fetch "$(release_url)/$_name" "$_pkg" || die "下载节点程序失败"
+            fetch "$(release_url)/$_name.sha256" "$_pkg.sha256" || die "下载 $_name.sha256 失败"
+            ;;
+        http://* | https://*)
+            log "下载节点程序 $TARBALL"
+            fetch "$TARBALL" "$_pkg" || die "下载 $TARBALL 失败"
+            fetch "$TARBALL.sha256" "$_pkg.sha256" 2>/dev/null || rm -f "$_pkg.sha256"
+            ;;
+        *)
+            [ -f "$TARBALL" ] || die "找不到节点程序包：$TARBALL"
+            cp "$TARBALL" "$_pkg"
+            if [ -f "$TARBALL.sha256" ]; then cp "$TARBALL.sha256" "$_pkg.sha256"; fi
+            ;;
+    esac
+
+    if [ -f "$_pkg.sha256" ]; then
+        verify_sha256 "$_pkg" "$_pkg.sha256" || die "节点程序校验失败：$_name"
+    else
+        warn "没有 .sha256 校验文件，跳过校验"
+    fi
+
+    mkdir -p "$TMP/pkg"
+    tar -xzf "$_pkg" -C "$TMP/pkg"
+    [ -f "$TMP/pkg/remnanode/dist/main.js" ] || die "节点程序包无效：缺少 dist/main.js"
+    _pkg_libc=$(cat "$TMP/pkg/remnanode/LIBC" 2>/dev/null || echo musl)
+    [ "$_pkg_libc" = "$LIBC" ] || die "程序包是 $_pkg_libc 版本，本机需要 $LIBC 版本（remnanode-$LIBC-$ARCH.tar.gz）"
+
+    if service_running; then
+        log "停止正在运行的节点"
+        svc stop >/dev/null 2>&1 || true
+    fi
+
+    rm -rf "$APP_DIR.new" "$APP_DIR.old"
+    mv "$TMP/pkg/remnanode" "$APP_DIR.new"
+    chown -R 0:0 "$APP_DIR.new"
+    chmod -R go-w "$APP_DIR.new"
+    if [ -d "$APP_DIR" ]; then mv "$APP_DIR" "$APP_DIR.old"; fi
+    mv "$APP_DIR.new" "$APP_DIR"
+    rm -rf "$APP_DIR.old"
+
+    # Rename over the running script: the shell keeps reading the old file.
+    install -m 755 "$APP_DIR/deploy/rwnode" "$SELF.new"
+    mv -f "$SELF.new" "$SELF"
+
+    log "Remnawave Node $(cat "$APP_DIR/VERSION") 已安装到 $APP_DIR"
+}
+
+xray_wanted() {
+    if [ -n "$XRAY_VERSION_ARG" ]; then
+        echo "$XRAY_VERSION_ARG"
+    elif [ -s "$STATE_DIR/xray.pin" ]; then
+        cat "$STATE_DIR/xray.pin"
+    else
+        echo "$XRAY_VERSION_DEFAULT"
+    fi
+}
+
+xray_installed_version() {
+    "$BIN_DIR/xray" version 2>/dev/null </dev/null | head -n 1 | awk '{ print $2 }'
+}
+
+install_xray() {
+    _want=$(xray_wanted)
+    case "$_want" in v*) ;; *) _want="v$_want" ;; esac
+
+    if [ "$(xray_installed_version)" = "${_want#v}" ]; then
+        log "Xray ${_want#v} 已安装"
+    else
+        log "安装 Xray $_want"
+        _base="https://github.com/$XRAY_REPO/Xray-core/releases/download/$_want"
+        fetch "$_base/$XRAY_ZIP" "$TMP/$XRAY_ZIP" || die "下载 Xray $_want 失败（版本是否存在？）"
+        fetch "$_base/$XRAY_ZIP.dgst" "$TMP/xray.dgst" || die "下载 $XRAY_ZIP.dgst 失败"
+        _sum=$(awk '/^SHA2-256=/ { print $2 }' "$TMP/xray.dgst")
+        [ -n "$_sum" ] || die "$XRAY_ZIP.dgst 中没有 SHA2-256"
+        echo "$_sum  $TMP/$XRAY_ZIP" | sha256sum -c - >/dev/null 2>&1 || die "Xray 校验失败：$XRAY_ZIP"
+
+        mkdir -p "$TMP/xray" "$XRAY_ASSETS"
+        node_unzip "$TMP/$XRAY_ZIP" "$TMP/xray" xray geoip.dat geosite.dat || die "解压 $XRAY_ZIP 失败"
+
+        # Rename over the old binary: writing into a running executable fails with ETXTBSY.
+        install -m 755 "$TMP/xray/xray" "$BIN_DIR/xray.new"
+        mv -f "$BIN_DIR/xray.new" "$BIN_DIR/xray"
+        install -m 644 "$TMP/xray/geoip.dat" "$XRAY_ASSETS/geoip.dat"
+        install -m 644 "$TMP/xray/geosite.dat" "$XRAY_ASSETS/geosite.dat"
+    fi
+
+    # rw-core is managed by the node afterwards (panel custom core), only create it once.
+    if [ ! -e "$BIN_DIR/rw-core" ]; then ln -sf "$BIN_DIR/xray" "$BIN_DIR/rw-core"; fi
+
+    mkdir -p "$STATE_DIR"
+    if [ -n "$XRAY_VERSION_ARG" ]; then
+        if [ "$_want" = "$XRAY_VERSION_DEFAULT" ]; then rm -f "$STATE_DIR/xray.pin"; else echo "$_want" > "$STATE_DIR/xray.pin"; fi
+    fi
+}
+
+install_geocheck() {
+    if [ -x "$BIN_DIR/geocheck" ] && [ "$(cat "$STATE_DIR/geocheck.version" 2>/dev/null)" = "$GEOCHECK_VERSION" ]; then
+        return 0
+    fi
+
+    log "安装 geocheck $GEOCHECK_VERSION"
+    _archive="geocheck_linux_$GO_ARCH.tar.gz"
+    _base="https://github.com/remnawave/geocheck/releases/download/v$GEOCHECK_VERSION"
+
+    if ! fetch "$_base/$_archive" "$TMP/$_archive" || ! fetch "$_base/checksums.txt" "$TMP/checksums.txt"; then
+        warn "下载 geocheck 失败，面板的「地理检测」功能将不可用"
+        return 0
+    fi
+    if ! (cd "$TMP" && grep "  $_archive\$" checksums.txt | sha256sum -c - >/dev/null 2>&1); then
+        warn "geocheck 校验失败，已跳过"
+        return 0
+    fi
+
+    tar -xzf "$TMP/$_archive" -C "$TMP" geocheck
+    install -m 755 "$TMP/geocheck" "$BIN_DIR/geocheck.new"
+    mv -f "$BIN_DIR/geocheck.new" "$BIN_DIR/geocheck"
+    mkdir -p "$STATE_DIR"
+    echo "$GEOCHECK_VERSION" > "$STATE_DIR/geocheck.version"
+}
+
+install_asn() {
+    log "下载 ASN 数据库"
+    if ! fetch "$ASN_URL" "$TMP/asn.lmdb.zst" || ! node_unzstd "$TMP/asn.lmdb.zst" "$TMP/asn.lmdb"; then
+        warn "下载 ASN 数据库失败，按 ASN 过滤的插件列表将不可用"
+        return 0
+    fi
+    mkdir -p "$ASN_DIR"
+    install -m 644 "$TMP/asn.lmdb" "$ASN_DIR/asn-prefixes.lmdb.new"
+    mv -f "$ASN_DIR/asn-prefixes.lmdb.new" "$ASN_DIR/asn-prefixes.lmdb"
+}
+
+remove_geocheck() {
+    rm -f "$BIN_DIR/geocheck" "$STATE_DIR/geocheck.version"
+}
+
+remove_asn() {
+    rm -rf "$ASN_DIR"
+}
+
+# ------------------------------------------------------------------ service
+
+openrc_booted() {
+    [ -e /run/openrc/softlevel ]
+}
+
+systemd_version() {
+    systemctl --version 2>/dev/null | head -n 1 | awk '{ print $2 }' | grep -oE '^[0-9]+' || echo 0
+}
+
+svc() {
+    case "$INIT" in
+        systemd) systemctl "$1" remnanode </dev/null ;;
+        openrc)
+            if ! openrc_booted; then
+                warn "OpenRC 没有运行，请手动启动：$APP_DIR/deploy/remnanode-start"
+                return 1
+            fi
+            rc-service remnanode "$1" </dev/null
+            ;;
+        *)
+            warn "没有检测到 systemd 或 OpenRC，请手动启动：$APP_DIR/deploy/remnanode-start"
+            return 1
+            ;;
+    esac
+}
+
+service_running() {
+    case "$INIT" in
+        systemd) systemctl is-active --quiet remnanode 2>/dev/null ;;
+        openrc) openrc_booted && rc-service remnanode status >/dev/null 2>&1 ;;
+        *) node_pid >/dev/null ;;
+    esac
+}
+
+install_service() {
+    mkdir -p "$LOG_DIR" /var/log/xray
+
+    case "$INIT" in
+        systemd)
+            install -m 644 "$APP_DIR/deploy/remnanode.service" "$SYSTEMD_UNIT"
+            # StandardOutput=append: needs systemd 240+ (RHEL 8 has 239).
+            if [ "$(systemd_version)" -lt 240 ]; then
+                sed -i -e 's/^StandardOutput=.*/StandardOutput=journal/' -e 's/^StandardError=.*/StandardError=journal/' "$SYSTEMD_UNIT"
+            fi
+            systemctl daemon-reload </dev/null
+            systemctl enable --quiet remnanode </dev/null 2>/dev/null || warn "systemctl enable remnanode 失败"
+            ;;
+        openrc)
+            install -m 755 "$APP_DIR/deploy/remnanode.initd" "$OPENRC_INITD"
+            rc-update add remnanode default </dev/null >/dev/null 2>&1 || warn "rc-update add remnanode 失败"
+            ;;
+        *) warn "没有检测到 systemd 或 OpenRC，不会注册开机自启" ;;
+    esac
+
+    printf '#!/bin/sh\nexec tail -n +1 -f %s\n' "$XRAY_LOG" > "$BIN_DIR/xlogs"
+    chmod 755 "$BIN_DIR/xlogs"
+    rm -f "$BIN_DIR/remnanode-cli"
+
+    if command -v logrotate >/dev/null 2>&1; then
+        cat > /etc/logrotate.d/remnanode <<EOF
+$LOG_DIR/*.log {
+    size 10M
+    rotate 3
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
+EOF
+        case "$INIT" in
+            systemd) systemctl enable --quiet --now logrotate.timer </dev/null >/dev/null 2>&1 || true ;;
+            openrc)
+                if [ -x /etc/init.d/crond ]; then
+                    rc-update add crond default </dev/null >/dev/null 2>&1 || true
+                    if openrc_booted; then rc-service crond start </dev/null >/dev/null 2>&1 || true; fi
+                fi
+                ;;
+        esac
+    fi
+}
+
+start_service() {
+    if [ "$START" != 1 ]; then
+        log "按要求未启动服务，稍后可运行：rwnode start"
+        return 0
+    fi
+    log "启动节点"
+    svc restart >/dev/null 2>&1 || {
+        show_log_tail
+        die "启动失败，日志见上"
+    }
+    sleep 3
+    if ! service_running; then
+        show_log_tail
+        die "节点启动后立即退出了，日志见上"
+    fi
+}
+
+show_log_tail() {
+    if [ -f "$NODE_LOG" ]; then
+        tail -n 30 "$NODE_LOG" >&2
+    elif [ "$INIT" = systemd ]; then
+        journalctl -u remnanode -n 30 --no-pager >&2 2>/dev/null || true
+    fi
+}
+
+check_limits() {
+    # shellcheck disable=SC3045 # busybox ash and dash support ulimit -H
+    _hard=$(ulimit -Hn)
+    if [ "$_hard" != unlimited ] && [ "$_hard" -lt 65536 ]; then
+        warn "文件句柄上限只有 $_hard，连接数多时可能不够。LXC 容器可在宿主的"
+        warn "  /etc/pve/lxc/<id>.conf 中加入 lxc.prlimit.nofile: 1048576 后重启容器"
+    fi
+}
+
+# ------------------------------------------------------------------ status
+
+node_pid() {
+    for _p in /proc/[0-9]*; do
+        if [ "$(head -c 7 "$_p/cmdline" 2>/dev/null)" = rw-node ]; then
+            echo "${_p#/proc/}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+xray_pid() {
+    _x=$(cat "$RUN_DIR/xray.pid" 2>/dev/null) || return 1
+    [ -n "$_x" ] && [ -d "/proc/$_x" ] && echo "$_x"
+}
+
+# Private memory (RssAnon): top's RES also counts the mapped, shareable program
+# files (about 70 MB for node), which the kernel can reclaim.
+rss_mb() {
+    awk '/^VmRSS:/ { rss = $2 } /^RssAnon:/ { anon = $2 }
+        END { if (anon == "") anon = rss; if (anon != "") printf "%d MB", anon / 1024 }' \
+        "/proc/$1/status" 2>/dev/null
+}
+
+installed() {
+    [ -f "$APP_DIR/VERSION" ]
+}
+
+print_header() {
+    printf "\n${C_BOLD}${C_CYAN}  Remnawave Node 管理面板${C_RESET}  ${C_DIM}rwnode${C_RESET}\n"
+    printf '  ------------------------------------------------------\n'
+    printf "  系统   %s · %s · %s\n" "$OS_NAME" "$ARCH" "$INIT"
+    if ! installed; then
+        printf "  状态   ${C_YELLOW}未安装${C_RESET}\n"
+        printf '  ------------------------------------------------------\n'
+        return 0
+    fi
+    _np=$(node_pid || true)
+    if [ -n "$_np" ]; then
+        printf "  状态   ${C_GREEN}● 运行中${C_RESET}\n"
+    else
+        printf "  状态   ${C_RED}○ 已停止${C_RESET}\n"
+    fi
+    _core=$("$BIN_DIR/rw-core" version 2>/dev/null </dev/null | head -n 1 | awk '{ print $2 }' || true)
+    printf "  版本   节点 %s · Xray %s · 端口 %s\n" "$(cat "$APP_DIR/VERSION")" "${_core:-?}" "$(conf_get NODE_PORT)"
+    if [ -n "$_np" ]; then
+        _xp=$(xray_pid || true)
+        if [ -n "$_xp" ]; then _xm=$(rss_mb "$_xp"); else _xm="未启动（等待面板下发配置）"; fi
+        printf "  内存   节点 %s · Xray %s ${C_DIM}（私有内存）${C_RESET}\n" "$(rss_mb "$_np")" "$_xm"
+    fi
+    printf '  ------------------------------------------------------\n'
+}
+
+# ------------------------------------------------------------------ actions
+
+TMP=""
+new_tmp() {
+    TMP=$(mktemp -d)
+}
+cleanup() {
+    if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
+}
+trap cleanup EXIT
+
+do_install() {
+    detect_system
+    new_tmp
+
+    # Passing --secret-key means an unattended install: never stop at a question.
+    _interactive=0
+    if [ -n "$IN" ] && [ -z "$SECRET_KEY_ARG" ]; then _interactive=1; fi
+
+    if installed && [ "$_interactive" = 1 ]; then
+        confirm "Remnawave Node 已安装，要重新安装吗？配置会保留" n || return 0
+    fi
+
+    configure_early
+
+    if [ -z "$WITH_ASN" ] && [ -z "$WITH_GEOCHECK" ] && [ "$_interactive" = 1 ]; then
+        if confirm "安装可选组件？ASN 数据库（约 12 MB，插件按 ASN 过滤时需要）和 geocheck（约 8 MB，面板「地理检测」需要）" y; then
+            WITH_ASN=1 WITH_GEOCHECK=1
+        else
+            WITH_ASN=0 WITH_GEOCHECK=0
+        fi
+    fi
+
+    ensure_tools
+    install_runtime
+    configure
+    install_app
+    install_xray
+    if [ "${WITH_GEOCHECK:-1}" = 1 ]; then install_geocheck; else remove_geocheck; fi
+    if [ "${WITH_ASN:-1}" = 1 ]; then
+        if [ ! -f "$ASN_DIR/asn-prefixes.lmdb" ]; then install_asn; fi
+    else
+        remove_asn
+    fi
+    install_service
+    pkg_cleanup
+    check_limits
+    start_service
+    print_summary
+}
+
+# Ask for the port and key before anything is downloaded.
+configure_early() {
+    if [ -z "$NODE_PORT_ARG" ] && [ -z "$(conf_get NODE_PORT)" ] && [ -n "$IN" ]; then
+        ask NODE_PORT_ARG "节点端口（面板连接节点用）" 2222
+        valid_port "$NODE_PORT_ARG" || die "端口无效：$NODE_PORT_ARG"
+    fi
+    if [ -z "$SECRET_KEY_ARG" ] && [ -z "$(conf_get SECRET_KEY)" ] && [ -n "$IN" ]; then
+        ask_long SECRET_KEY_ARG "粘贴面板中的 SECRET_KEY（可直接粘贴 SECRET_KEY=\"...\" 整行）"
+        valid_key "$(normalize_key "$SECRET_KEY_ARG")" || die "SECRET_KEY 无效，请从面板重新复制（节点 -> 复制 SECRET_KEY）"
+    fi
+}
+
+do_update() {
+    installed || die "Remnawave Node 还没有安装，请先安装"
+    detect_system
+    new_tmp
+    ensure_tools
+    install_runtime
+    if [ -n "$SECRET_KEY_ARG" ] || [ -n "$NODE_PORT_ARG" ]; then configure; fi
+    install_app
+    install_xray
+    if [ -f "$STATE_DIR/geocheck.version" ] || [ "$WITH_GEOCHECK" = 1 ]; then install_geocheck; fi
+    if [ -f "$ASN_DIR/asn-prefixes.lmdb" ] || [ "$WITH_ASN" = 1 ]; then install_asn; fi
+    install_service
+    pkg_cleanup
+    start_service
+    log "已更新到 $(cat "$APP_DIR/VERSION")"
+}
+
+do_uninstall() {
+    detect_system
+
+    if service_running; then svc stop >/dev/null 2>&1 || true; fi
+    case "$INIT" in
+        systemd) systemctl disable --quiet remnanode </dev/null >/dev/null 2>&1 || true ;;
+        openrc) rc-update del remnanode default </dev/null >/dev/null 2>&1 || true ;;
+    esac
+    rm -f "$SYSTEMD_UNIT" "$OPENRC_INITD" /etc/logrotate.d/remnanode
+    if [ "$INIT" = systemd ]; then systemctl daemon-reload </dev/null || true; fi
+
+    rm -rf "$APP_DIR" "$APP_DIR.new" "$APP_DIR.old" "$RUNTIME_DIR" "$RUN_DIR"
+    rm -f "$BIN_DIR/xlogs" "$BIN_DIR/remnanode-cli" "$SELF"
+
+    if [ "$PURGE" = 1 ]; then
+        rm -rf "$CONF_DIR" "$STATE_DIR" "$LOG_DIR" /var/log/xray "$ASN_DIR" "$XRAY_ASSETS"
+        rm -f "$BIN_DIR/xray" "$BIN_DIR/xray-custom" "$BIN_DIR/rw-core" "$BIN_DIR/.rw-core.json" "$BIN_DIR/geocheck"
+        log "已卸载 Remnawave Node，并删除了配置、Xray 和数据文件"
+    else
+        log "已卸载 Remnawave Node。配置（$CONF_FILE）和 Xray 已保留，彻底删除请加 --purge"
+    fi
+}
+
+set_port() {
+    installed || die "Remnawave Node 还没有安装"
+    valid_port "$1" || die "端口无效：$1"
+    detect_system
+    conf_set NODE_PORT "$1"
+    log "端口已改为 $1，请同时在面板中把该节点的端口改成 $1"
+    restart_service
+}
+
+set_key() {
+    installed || die "Remnawave Node 还没有安装"
+    _new_key=$(normalize_key "$1")
+    valid_key "$_new_key" || die "SECRET_KEY 无效，请从面板重新复制"
+    detect_system
+    conf_set SECRET_KEY "$_new_key"
+    log "SECRET_KEY 已更新"
+    restart_service
+}
+
+restart_service() {
+    START=1
+    start_service
+}
+
+switch_xray() {
+    installed || die "Remnawave Node 还没有安装"
+    detect_system
+    new_tmp
+    resolve_node
+    [ -n "$NODE" ] || die "找不到 Node.js 运行时，请先执行 rwnode update"
+    case "$1" in default | 默认) XRAY_VERSION_ARG=$XRAY_VERSION_DEFAULT ;; *) XRAY_VERSION_ARG=$1 ;; esac
+    install_xray
+    if [ "$(readlink "$BIN_DIR/rw-core" 2>/dev/null)" != "$BIN_DIR/xray" ]; then
+        warn "面板为该节点配置了自定义内核（$(readlink "$BIN_DIR/rw-core")），在面板中取消后才会使用这里安装的 Xray"
+    fi
+    restart_service
+}
+
+dump_config() {
+    installed || die "Remnawave Node 还没有安装"
+    _out=${1:-/root/rwnode-xray-config.json}
+    (
+        umask 077
+        "$APP_DIR/deploy/remnanode-cli" --dump-config-raw > "$_out" </dev/null
+    ) || die "导出失败：节点是否在运行？"
+    log "当前 Xray 配置已导出到 $_out（含用户密钥，请妥善保管）"
+}
+
+# FOLLOW_EXEC=1 (rwnode log/xlog): replace the shell, so whoever stops the
+# command stops tail too, instead of leaving it behind as an orphan.
+FOLLOW_EXEC=0
+
+follow() {
+    # follow FILE: tail -f until Ctrl+C, then return to the caller
+    [ -f "$1" ] || die "日志文件不存在：$1"
+    [ "$FOLLOW_EXEC" = 0 ] || exec tail -n 50 -f "$1"
+    printf "${C_DIM}按 Ctrl+C 返回${C_RESET}\n"
+    trap 'true' INT
+    tail -n 50 -f "$1" || true
+    trap - INT
+}
+
+show_node_log() {
+    if [ -f "$NODE_LOG" ]; then
+        follow "$NODE_LOG"
+    else
+        [ "$FOLLOW_EXEC" = 0 ] || exec journalctl -u remnanode -n 50 -f
+        journalctl -u remnanode -n 50 -f
+    fi
+}
+
+print_summary() {
+    printf "\n  ${C_GREEN}Remnawave Node 安装完成${C_RESET}\n\n"
+    printf '  面板中填写的节点端口：%s\n' "${NODE_PORT:-$(conf_get NODE_PORT)}"
+    printf '  配置文件：%s\n' "$CONF_FILE"
+    printf '  以后输入 %s 打开管理面板\n\n' "$(printf "${C_BOLD}rwnode${C_RESET}")"
+}
+
+do_status() {
+    detect_system
+    print_header
+    if installed; then
+        case "$INIT" in
+            systemd) systemctl status remnanode --no-pager -n 0 2>/dev/null | head -n 5 || true ;;
+            openrc) if openrc_booted; then rc-service remnanode status || true; fi ;;
+        esac
+        if [ -f "$NODE_LOG" ]; then
+            printf "\n  最近的节点日志（%s）：\n" "$NODE_LOG"
+            tail -n 15 "$NODE_LOG" | sed 's/^/  /'
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------ menu
+
+# Runs an action with errexit in a subshell, so a failure returns to the menu.
+# Subshells reset traps: each one cleans up its own temp dir.
+run() {
+    set +e
+    (
+        trap cleanup EXIT
+        set -e
+        "$@"
+    )
+    RC=$?
+    set -e
+}
+
+# Ctrl+C while following a log must stop tail, not the menu.
+run_follow() {
+    trap 'true' INT
+    run "$@"
+    trap - INT
+}
+
+menu_line() {
+    printf "  ${C_CYAN}%2s${C_RESET}  %s\n" "$1" "$2"
+}
+
+menu() {
+    detect_system
+    while :; do
+        [ ! -t 1 ] || printf '\033[H\033[2J'
+        print_header
+        menu_line 1 "安装 / 重装"
+        menu_line 2 "更新（节点程序、Xray、数据文件）"
+        menu_line 3 "卸载"
+        printf '\n'
+        menu_line 4 "启动"
+        menu_line 5 "停止"
+        menu_line 6 "重启"
+        printf '\n'
+        menu_line 7 "修改端口"
+        menu_line 8 "修改 SECRET_KEY"
+        menu_line 9 "切换 Xray 版本"
+        printf '\n'
+        menu_line 10 "查看节点日志"
+        menu_line 11 "查看 Xray 日志"
+        menu_line 12 "导出当前 Xray 配置"
+        printf '\n'
+        menu_line 0 "退出"
+        printf '\n'
+        ASK_EOF=0
+        _choice=""
+        ask _choice "请选择" ""
+        if [ "$ASK_EOF" = 1 ]; then
+            printf '\n'
+            exit 0
+        fi
+
+        case "$_choice" in
+            1) run do_install ;;
+            2)
+                if installed; then run do_update; else warn "还没有安装"; fi
+                ;;
+            3)
+                menu_uninstall
+                if [ "$RC" = 0 ] && ! installed; then exit 0; fi
+                ;;
+            4) run svc start ;;
+            5) run svc stop ;;
+            6) run svc restart ;;
+            7)
+                ask _port "新的节点端口" "$(conf_get NODE_PORT)"
+                run set_port "$_port"
+                ;;
+            8)
+                ask_long _key "粘贴新的 SECRET_KEY"
+                run set_key "$_key"
+                ;;
+            9) menu_xray ;;
+            10) run_follow show_node_log ;;
+            11) run_follow follow "$XRAY_LOG" ;;
+            12) run dump_config ;;
+            0 | q | Q | exit) exit 0 ;;
+            *)
+                warn "无效的选项：$_choice"
+                RC=0
+                ;;
+        esac
+        pause
+    done
+}
+
+menu_uninstall() {
+    RC=1
+    if ! installed; then
+        warn "还没有安装"
+        return 0
+    fi
+    confirm "确定要卸载 Remnawave Node 吗" n || return 0
+    if confirm "同时删除配置（SECRET_KEY）、Xray 和数据文件吗" n; then PURGE=1; else PURGE=0; fi
+    run do_uninstall
+}
+
+menu_xray() {
+    printf '  当前 Xray：%s，本版本默认：%s\n' "$(xray_installed_version || echo ?)" "${XRAY_VERSION_DEFAULT#v}"
+    printf '  可选版本见 https://github.com/XTLS/Xray-core/releases\n'
+    ask _xv "输入版本号（如 26.7.28），输入 default 恢复默认" ""
+    [ -n "$_xv" ] || return 0
+    run switch_xray "$_xv"
+}
+
+# ------------------------------------------------------------------ cli
+
+usage() {
+    cat <<EOF
+Remnawave Node 管理工具 rwnode
+
+用法：rwnode [命令] [选项]
+
+  (无参数)            打开管理面板
+  install             安装或重装
+  update              更新节点程序、Node.js 运行时、Xray 和数据文件
+  uninstall           卸载（加 --purge 同时删除配置、Xray 和数据）
+  start|stop|restart  启动 / 停止 / 重启
+  status              查看状态和最近的日志
+  port <端口>         修改节点端口并重启
+  key <SECRET_KEY>    更换 SECRET_KEY 并重启
+  xray <版本|default> 切换 Xray 版本
+  log                 实时查看节点日志
+  xlog                实时查看 Xray 日志
+  dump [文件]         导出当前 Xray 配置（默认 /root/rwnode-xray-config.json）
+  cli [参数]          运行节点自带的 CLI（remnanode-cli）
+  help                显示本帮助
+
+安装 / 更新选项：
+  --secret-key KEY    面板中的 SECRET_KEY
+  --port PORT         节点端口（默认 2222）
+  --xray-version V    指定 Xray 版本（默认 ${XRAY_VERSION_DEFAULT#v}）
+  --no-asn            不安装 ASN 数据库（约 12 MB）
+  --no-geocheck       不安装 geocheck（约 8 MB）
+  --tarball PATH|URL  使用指定的节点程序包
+  --release TAG       指定 Release（默认 latest）
+  --repo OWNER/REPO   Release 所在仓库（默认 $REPO）
+  --no-start          只安装，不启动
+  -y, --yes           不询问，全部使用默认值
+
+一键安装（无人值守）：
+  wget -qO- https://github.com/$REPO/releases/latest/download/install.sh | sh -s -- install --port 2222 --secret-key '<SECRET_KEY>'
+EOF
+}
+
+ASK_EOF=0
+ACTION=""
+ACTION_ARG=""
+SECRET_KEY_ARG=""
+NODE_PORT_ARG=""
+XRAY_VERSION_ARG=""
+TARBALL=""
+WITH_ASN=""
+WITH_GEOCHECK=""
+START=1
+PURGE=0
+ASSUME_YES=0
+NODE=""
+
+need_value() {
+    [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 需要一个值"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        install | update | uninstall | status | start | stop | restart | log | xlog | help | menu) ACTION=$1 ;;
+        port | key | xray | dump)
+            ACTION=$1
+            if [ "$#" -ge 2 ]; then
+                ACTION_ARG=$2
+                shift
+            fi
+            ;;
+        cli)
+            shift
+            ACTION=cli
+            break
+            ;;
+        --secret-key)
+            need_value "$@"
+            SECRET_KEY_ARG=$2
+            shift
+            ;;
+        --secret-key=*) SECRET_KEY_ARG=${1#*=} ;;
+        --port)
+            need_value "$@"
+            NODE_PORT_ARG=$2
+            shift
+            ;;
+        --port=*) NODE_PORT_ARG=${1#*=} ;;
+        --xray-version)
+            need_value "$@"
+            XRAY_VERSION_ARG=$2
+            shift
+            ;;
+        --tarball)
+            need_value "$@"
+            TARBALL=$2
+            shift
+            ;;
+        --release)
+            need_value "$@"
+            RELEASE=$2
+            shift
+            ;;
+        --repo)
+            need_value "$@"
+            REPO=$2
+            shift
+            ;;
+        --no-asn) WITH_ASN=0 ;;
+        --no-geocheck) WITH_GEOCHECK=0 ;;
+        --no-start) START=0 ;;
+        --purge) PURGE=1 ;;
+        -y | --yes) ASSUME_YES=1 ;;
+        -h | --help) ACTION=help ;;
+        *) die "未知参数：$1（rwnode help 查看用法）" ;;
+    esac
+    shift
+done
+
+# `install.sh --secret-key ...` without a command keeps working as before.
+if [ -z "$ACTION" ]; then
+    if [ -n "$SECRET_KEY_ARG$NODE_PORT_ARG$TARBALL" ]; then ACTION=install; else ACTION=menu; fi
+fi
+if [ "$ASSUME_YES" = 1 ]; then IN=""; fi
+
+case "$ACTION" in
+    menu)
+        [ -n "$IN" ] || {
+            usage
+            exit 1
+        }
+        menu
+        ;;
+    install) do_install ;;
+    update) do_update ;;
+    uninstall) do_uninstall ;;
+    status) do_status ;;
+    start | stop | restart)
+        detect_system
+        installed || die "Remnawave Node 还没有安装"
+        svc "$ACTION"
+        ;;
+    port)
+        [ -n "$ACTION_ARG" ] || die "用法：rwnode port <端口>"
+        set_port "$ACTION_ARG"
+        ;;
+    key)
+        [ -n "$ACTION_ARG" ] || die "用法：rwnode key <SECRET_KEY>"
+        set_key "$ACTION_ARG"
+        ;;
+    xray)
+        [ -n "$ACTION_ARG" ] || die "用法：rwnode xray <版本|default>"
+        switch_xray "$ACTION_ARG"
+        ;;
+    log)
+        detect_system
+        FOLLOW_EXEC=1
+        show_node_log
+        ;;
+    xlog)
+        FOLLOW_EXEC=1
+        follow "$XRAY_LOG"
+        ;;
+    dump) dump_config "$ACTION_ARG" ;;
+    cli)
+        installed || die "Remnawave Node 还没有安装"
+        exec "$APP_DIR/deploy/remnanode-cli" "$@"
+        ;;
+    help) usage ;;
+esac

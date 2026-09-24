@@ -4,6 +4,7 @@ set -eu
 
 APP_DIR="${REMNANODE_HOME:-/opt/remnanode}"
 RUN_DIR="${REMNANODE_RUN_DIR:-/run/remnanode}"
+RUNTIME_NODE=/usr/local/lib/remnanode/node/bin/node
 
 if [ -f "$RUN_DIR/internal.env" ]; then
     set -a
@@ -12,4 +13,6 @@ if [ -f "$RUN_DIR/internal.env" ]; then
     set +a
 fi
 
-exec node "$APP_DIR/dist/cli.js" "$@"
+if [ -x "$RUNTIME_NODE" ]; then NODE_BIN=$RUNTIME_NODE; else NODE_BIN=node; fi
+
+exec "$NODE_BIN" "$APP_DIR/dist/cli.js" "$@"

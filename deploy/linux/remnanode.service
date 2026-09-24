@@ -1,0 +1,22 @@
+[Unit]
+Description=Remnawave Node
+Documentation=https://github.com/besire/node
+# Node only listens on NODE_PORT: do not wait for network-online, which can
+# hang for minutes in containers whose network is configured by the host.
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/remnanode/deploy/remnanode-start
+Restart=always
+RestartSec=5
+# Node stops Xray (up to 10s) and removes its nftables table on SIGTERM;
+# anything left in the cgroup afterwards is killed.
+KillMode=mixed
+TimeoutStopSec=25
+LogsDirectory=remnanode
+StandardOutput=append:/var/log/remnanode/node.log
+StandardError=append:/var/log/remnanode/node.log
+
+[Install]
+WantedBy=multi-user.target
