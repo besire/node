@@ -10,6 +10,25 @@ import pkg from './package.json' with { type: 'json' };
 
 const isDev = process.env.NODE_ENV !== 'production';
 
+// RWNODE_BUNDLE=1 (scripts/package.sh): bundle the JS dependencies into dist/*.js
+// and keep only native addons external, plus NestJS's optional peers, which are
+// not installed and are required inside try/catch.
+const bundleDeps = process.env.RWNODE_BUNDLE === '1';
+const BUNDLE_EXTERNALS = [
+    'lmdb',
+    'msgpackr-extract',
+    'nftables-napi',
+    'sockdestroy',
+    '@nestjs/microservices',
+    '@nestjs/websockets',
+    '@nestjs/platform-socket.io',
+    'class-transformer',
+    'class-validator',
+    '@fastify/static',
+    // ESM-only, loaded lazily by @nestjs/common's file upload validator (unused)
+    'file-type',
+];
+
 if (isDev) {
     try {
         process.loadEnvFile('.env');
@@ -104,9 +123,18 @@ export default defineConfig({
             },
         }),
     ],
-    externals: [
-        nodeExternals({
-            allowlist: [/@rspack\/core\/hot\/poll/],
-        }),
-    ],
+    externals: bundleDeps
+        ? [
+              ({ request }, callback) => {
+                  const external = BUNDLE_EXTERNALS.some(
+                      (name) => request === name || request?.startsWith(`${name}/`),
+                  );
+                  return external ? callback(undefined, `commonjs ${request}`) : callback();
+              },
+          ]
+        : [
+              nodeExternals({
+                  allowlist: [/@rspack\/core\/hot\/poll/],
+              }),
+          ],
 });
