@@ -1,6 +1,6 @@
 [Unit]
 Description=Remnawave Node
-Documentation=https://github.com/besire/node
+Documentation=https://github.com/besire/remnanode-thin
 # Node only listens on NODE_PORT: do not wait for network-online, which can
 # hang for minutes in containers whose network is configured by the host.
 After=network.target

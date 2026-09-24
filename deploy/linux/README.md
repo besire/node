@@ -1,6 +1,6 @@
-# Remnawave Node · Linux 一键部署（无 Docker）
+# remnanode-thin · Linux 一键部署（无 Docker）
 
-直接在 Linux 上运行 Remnawave Node，不需要 Docker：LXC 容器（Proxmox、Incus）、VPS、虚拟机都可以。
+remnanode-thin 直接在 Linux 上运行 Remnawave Node，不需要 Docker：LXC 容器（Proxmox、Incus）、VPS、虚拟机都可以。
 功能与官方 Docker 镜像一致，面板看到的是同一个节点：所有接口、插件（nftables、torrent blocker、断连）、自定义内核、geodata 都保留。
 
 ## 支持的系统
@@ -18,13 +18,13 @@ CPU 架构：x86_64、aarch64。
 ## 一键安装
 
 ```sh
-wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh
+wget -qO- https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh
 ```
 
 没有 wget 的系统（如 Rocky）用 curl：
 
 ```sh
-curl -fsSL https://github.com/besire/node/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh
 ```
 
 会打开管理面板：选 `1`，输入节点端口，粘贴面板中的 SECRET_KEY（可以直接粘贴 `SECRET_KEY="..."` 整行），完成。
@@ -33,7 +33,7 @@ curl -fsSL https://github.com/besire/node/releases/latest/download/install.sh | 
 无人值守安装（脚本、批量部署），传入 `--secret-key` 后全程不提问：
 
 ```sh
-wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh -s -- install --port 2222 --secret-key '面板里的 SECRET_KEY'
+wget -qO- https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh -s -- install --port 2222 --secret-key '面板里的 SECRET_KEY'
 ```
 
 安装过程不依赖发行版的包管理器：下载用系统自带的 wget/curl，Xray 的 zip、ASN 库的 zstd 由 Node.js 解压，Debian/Ubuntu 上不会执行 `apt-get update`。只有缺少 wget/curl、证书或 logrotate 时才会调用包管理器安装。
@@ -155,7 +155,7 @@ NODE_MAX_HEAP_MB=192
 旧版安装脚本没有 `rwnode`，执行一次新脚本的 update 即可：
 
 ```sh
-wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh -s -- update
+wget -qO- https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh -s -- update
 ```
 
 ## 构建与发布

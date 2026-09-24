@@ -1,3 +1,7 @@
+# remnanode-thin
+
+不用 Docker 的精简版 Remnawave Node：一条命令安装，内存和磁盘占用更小。
+
 ## Remnawave Node
 
 Node for Remnawave Panel.
@@ -6,10 +10,10 @@ Learn more about Remnawave Panel [here](https://docs.rw/).
 
 ## Linux 一键部署（无 Docker）
 
-本仓库是 [remnawave/node](https://github.com/remnawave/node) 的 fork，额外提供不依赖 Docker 的部署方式：Debian、Ubuntu、Rocky / Alma、Alpine 等主流发行版，LXC 容器（Proxmox、Incus）、VPS、虚拟机都可以。功能与官方 Docker 镜像一致，面板侧无需任何改动。
+remnanode-thin 是 [remnawave/node](https://github.com/remnawave/node) 的 fork，额外提供不依赖 Docker 的部署方式：Debian、Ubuntu、Rocky / Alma、Alpine 等主流发行版，LXC 容器（Proxmox、Incus）、VPS、虚拟机都可以。功能与官方 Docker 镜像一致，面板侧无需任何改动。
 
 ```sh
-wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh
+wget -qO- https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh
 ```
 
 没有 wget 的系统用 `curl -fsSL <同一个地址> | sh`。脚本会打开管理面板：选 `1` 安装，输入节点端口，粘贴面板中的 SECRET_KEY 即可。以后输入 **`rwnode`** 随时打开面板（启停、更新、改端口、换 SECRET_KEY、切换 Xray 版本、看日志、卸载）。

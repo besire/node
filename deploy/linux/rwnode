@@ -1,16 +1,16 @@
 #!/bin/sh
-# rwnode - Remnawave Node manager for Linux without Docker
+# rwnode - manager of remnanode-thin, Remnawave Node for Linux without Docker
 # (Debian, Ubuntu, RHEL family, Alpine; LXC containers or VMs).
 #
-#   wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | sh
-#   curl -fsSL https://github.com/besire/node/releases/latest/download/install.sh | sh
+#   wget -qO- https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/besire/remnanode-thin/releases/latest/download/install.sh | sh
 #
 # Without arguments it opens the menu, `rwnode help` lists the commands.
 #
 # shellcheck disable=SC2059 # printf formats only embed the constant C_* color codes
 set -eu
 
-REPO="${REMNANODE_REPO:-besire/node}"
+REPO="${REMNANODE_REPO:-besire/remnanode-thin}"
 RELEASE="${REMNANODE_RELEASE:-latest}"
 XRAY_VERSION_DEFAULT="v26.6.27"
 # Oldest Xray the node works with: its API inbound listens on a unix socket
@@ -1119,7 +1119,7 @@ menu_xray() {
 
 usage() {
     cat <<EOF
-Remnawave Node 管理工具 rwnode
+Remnawave Node 管理工具 rwnode（remnanode-thin，https://github.com/$REPO）
 
 用法：rwnode [命令] [选项]
 
