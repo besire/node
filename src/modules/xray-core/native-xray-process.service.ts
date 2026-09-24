@@ -14,6 +14,7 @@ import { dirname } from 'node:path';
 
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 
+import { InternalService } from '../internal/internal.service';
 import { IXrayProcessStatus, XrayProcessService } from './xray-process.service';
 
 const CORE_LINK = '/usr/local/bin/rw-core';
@@ -36,6 +37,11 @@ interface IExitInfo {
  * `start` is "up once" (no auto-restart), `stop` sends SIGTERM and escalates
  * to SIGKILL, and output goes to the same log file s6-log would write.
  *
+ * The config is written to Xray's stdin (`-config stdin:`), which every Xray
+ * version supports. The s6 service instead lets Xray fetch it from the node's
+ * internal API over an abstract unix socket (`-config @socket:/path`), which
+ * Xray only understands since v26.6.1; older cores exit with "no such file".
+ *
  * Enabled with XRAY_PROCESS_MANAGER=native.
  */
 @Injectable()
@@ -51,7 +57,7 @@ export class NativeXrayProcessService extends XrayProcessService implements OnMo
     private logStream: WriteStream | null = null;
     private logBytes = 0;
 
-    constructor() {
+    constructor(private readonly internalService: InternalService) {
         super();
 
         this.pidFile = `${process.env.REMNANODE_RUN_DIR ?? '/run/remnanode'}/xray.pid`;
@@ -75,20 +81,14 @@ export class NativeXrayProcessService extends XrayProcessService implements OnMo
     public override async start(): Promise<void> {
         if (this.isAlive()) return;
 
-        const socketPath = process.env.INTERNAL_SOCKET_PATH;
-        const token = process.env.INTERNAL_REST_TOKEN;
-
-        if (!socketPath || !token) {
-            throw new Error('INTERNAL_SOCKET_PATH or INTERNAL_REST_TOKEN is not set');
-        }
+        const config = JSON.stringify(await this.internalService.getXrayConfig());
 
         const { SECRET_KEY: _secretKey, ...env } = process.env;
 
-        const child = spawn(
-            CORE_LINK,
-            ['-config', `@${socketPath}:/internal/get-config?token=${token}`, '-format', 'json'],
-            { env, stdio: ['ignore', 'pipe', 'pipe'] },
-        );
+        const child = spawn(CORE_LINK, ['-config', 'stdin:', '-format', 'json'], {
+            env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
 
         await new Promise<void>((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -113,6 +113,13 @@ export class NativeXrayProcessService extends XrayProcessService implements OnMo
         this.openLog();
         child.stdout?.on('data', (chunk: Buffer) => this.writeLog(chunk));
         child.stderr?.on('data', (chunk: Buffer) => this.writeLog(chunk));
+
+        // Xray reads stdin to EOF before parsing. If it exits early (bad binary),
+        // the write fails with EPIPE: the exit is reported below, not as a crash.
+        child.stdin?.on('error', (error) => {
+            this.nativeLogger.warn(`Failed to pass the config to Xray: ${error.message}`);
+        });
+        child.stdin?.end(config);
 
         child.once('exit', (code, signal) => {
             this.lastExit = { code, signal, at: Date.now() };
@@ -248,10 +255,11 @@ export class NativeXrayProcessService extends XrayProcessService implements OnMo
 
             const argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
 
-            if (
-                argv[0] !== CORE_LINK ||
-                !argv.some((arg) => arg.includes('/internal/get-config'))
-            ) {
+            // `/internal/get-config`: an Xray started by a node before the stdin loader
+            const startedByNode =
+                argv.includes('stdin:') || argv.some((arg) => arg.includes('/internal/get-config'));
+
+            if (argv[0] !== CORE_LINK || !startedByNode) {
                 return;
             }
 
