@@ -45,7 +45,7 @@ wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | s
   ------------------------------------------------------
   系统   Debian GNU/Linux 13 (trixie) · x64 · systemd
   状态   ● 运行中
-  版本   节点 3.4.1 · Xray 26.7.28 · 端口 2222
+  版本   节点 3.4.1 · Xray 26.6.27 · 端口 2222
   内存   节点 43 MB · Xray 10 MB（私有内存）
   ------------------------------------------------------
    1  安装 / 重装
@@ -76,7 +76,7 @@ wget -qO- https://github.com/besire/node/releases/latest/download/install.sh | s
 | `rwnode start` / `stop` / `restart` / `status` | 服务控制和状态 |
 | `rwnode port 3333` | 修改节点端口并重启（面板里的节点端口要改成一致） |
 | `rwnode key '<SECRET_KEY>'` | 更换 SECRET_KEY 并重启 |
-| `rwnode xray 26.7.28` / `rwnode xray default` | 切换 Xray 版本 / 恢复默认版本 |
+| `rwnode xray 26.9.9` / `rwnode xray default` | 切换 Xray 版本（需要 26.5.3 或更高）/ 恢复默认版本（26.6.27） |
 | `rwnode log` / `rwnode xlog` | 实时查看节点 / Xray 日志 |
 | `rwnode dump` | 导出当前 Xray 配置到 `/root/rwnode-xray-config.json`（600 权限） |
 
@@ -177,5 +177,14 @@ install.sh                                  即 rwnode
 
 - 代码改动只有两处：`src/modules/xray-core/native-xray-process.service.ts`，以及 `xray.module.ts` 里按 `XRAY_PROCESS_MANAGER=native` 切换实现。不设这个变量时行为与 Docker 版完全相同，方便继续合并上游更新。
 - native 模式沿用 s6 的语义：启动后不自动重启（由面板健康检查负责拉起），停止时先 SIGTERM，3 秒后 SIGKILL；xray 输出写入 `/var/log/xray/current`，超过 10 MB 轮转。
+- 配置通过 stdin 传给 Xray（`-config stdin:`），不落盘。Docker 版让 Xray 经 abstract unix socket 自己拉取配置（`-config @socket:/path`），这种写法 Xray 26.6.1 才支持，更早的版本会报 `open @rwint-...: no such file or directory`。
 - node 被 SIGKILL 或 OOM 杀掉时，残留的 xray 会被清理（systemd 通过 cgroup，OpenRC 通过 pid 文件），不会占着端口。
 - 内部 socket 和 token 每次启动随机生成（与 Docker 版的 `init-env.sh` 相同）。在 LXC 中，abstract socket 隔离在容器自己的网络命名空间里，比 Docker 的 `network_mode: host` 更安全。
+
+## Xray 版本要求
+
+默认 26.6.27，最低 **26.5.3**。更早的版本即使能读到配置也用不了：节点通过 unix socket 上的 `tunnel` 入站调用 Xray API（26.4.13 起支持，26.5.3 修复了连接时的崩溃），面板的流量统计用的 `GetUsersStats` 也是 26.4.13 才加入。
+
+实测（Debian 13 / Alpine 3.24）：26.5.9、26.6.27、26.7.28 正常；26.3.27（GitHub 上标为 latest 的版本）、25.10.15、25.8.3 能启动但节点连不上 API；25.7.26 不认识 `tunnel` 协议。
+
+`rwnode xray` 会拒绝低于 26.5.3 的版本；以前固定过的旧版本，`rwnode update` 时会自动换回默认版本。面板里给节点配置的自定义内核不经过 rwnode，同样需要 26.5.3 或更高。
