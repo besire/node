@@ -1,0 +1,60 @@
+name: Build Linux packages
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.libc }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { libc: musl, arch: x64, runner: ubuntu-latest }
+          - { libc: musl, arch: arm64, runner: ubuntu-24.04-arm }
+          - { libc: glibc, arch: x64, runner: ubuntu-latest }
+          - { libc: glibc, arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build node package
+        run: sh scripts/package.sh ${{ matrix.libc }}
+
+      # Standalone Node.js for hosts without a Node.js 24 package
+      # (official builds exist for glibc x64/arm64 and musl x64).
+      - name: Build Node.js runtime
+        if: matrix.libc == 'glibc' || matrix.arch == 'x64'
+        run: sh scripts/package-runtime.sh ${{ matrix.libc }} ${{ matrix.arch }}
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: remnanode-${{ matrix.libc }}-${{ matrix.arch }}
+          path: build/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Attach to release
+    needs: [package]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: build
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*
