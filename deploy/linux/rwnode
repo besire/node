@@ -12,7 +12,11 @@ set -eu
 
 REPO="${REMNANODE_REPO:-besire/node}"
 RELEASE="${REMNANODE_RELEASE:-latest}"
-XRAY_VERSION_DEFAULT="v26.7.28"
+XRAY_VERSION_DEFAULT="v26.6.27"
+# Oldest Xray the node works with: its API inbound listens on a unix socket
+# (Xray 26.4.13, crash on connect fixed in 26.5.3) and traffic stats use
+# GetUsersStats (26.4.13).
+XRAY_VERSION_MIN="v26.5.3"
 XRAY_REPO="${XRAY_REPO:-XTLS}"
 GEOCHECK_VERSION="0.3.0"
 NODE_VERSION="v24.21.0"
@@ -156,6 +160,11 @@ glibc_version() {
 
 version_ge() {
     awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, "."); if (x[1] != y[1]) exit !(x[1] > y[1]); exit !(x[2] + 0 >= y[2] + 0) }'
+}
+
+# version_lt A B: A < B for x.y.z versions, with or without the leading v
+version_lt() {
+    awk -v a="${1#v}" -v b="${2#v}" 'BEGIN { split(a, x, "."); split(b, y, "."); for (i = 1; i <= 3; i++) if (x[i] + 0 != y[i] + 0) exit !(x[i] + 0 < y[i] + 0); exit 1 }'
 }
 
 fetch() {
@@ -548,6 +557,13 @@ xray_installed_version() {
 install_xray() {
     _want=$(xray_wanted)
     case "$_want" in v*) ;; *) _want="v$_want" ;; esac
+
+    if version_lt "$_want" "$XRAY_VERSION_MIN"; then
+        [ -z "$XRAY_VERSION_ARG" ] || die "Xray ${_want#v} 太旧，本节点需要 ${XRAY_VERSION_MIN#v} 或更高（旧版不支持节点通过 unix socket 调用的 Xray API）"
+        warn "之前固定的 Xray ${_want#v} 低于节点要求的 ${XRAY_VERSION_MIN#v}，改用默认版本 ${XRAY_VERSION_DEFAULT#v}"
+        rm -f "$STATE_DIR/xray.pin"
+        _want=$XRAY_VERSION_DEFAULT
+    fi
 
     if [ "$(xray_installed_version)" = "${_want#v}" ]; then
         log "Xray ${_want#v} 已安装"
@@ -1093,8 +1109,8 @@ menu_uninstall() {
 
 menu_xray() {
     printf '  当前 Xray：%s，本版本默认：%s\n' "$(xray_installed_version || echo ?)" "${XRAY_VERSION_DEFAULT#v}"
-    printf '  可选版本见 https://github.com/XTLS/Xray-core/releases\n'
-    ask _xv "输入版本号（如 26.7.28），输入 default 恢复默认" ""
+    printf '  可选版本见 https://github.com/XTLS/Xray-core/releases（需要 %s 或更高）\n' "${XRAY_VERSION_MIN#v}"
+    ask _xv "输入版本号（如 26.6.27），输入 default 恢复默认" ""
     [ -n "$_xv" ] || return 0
     run switch_xray "$_xv"
 }
